@@ -16,6 +16,8 @@ struct Grid_private {
   PetscInt level;
   PetscInt M[3],p[3];
   PetscInt s[3],m[3];   // Owned cells of global grid
+  PetscInt nsrb;
+  PetscInt sridx;
   struct {
     PetscMPIInt rank;
     PetscInt ri[3];
@@ -152,13 +154,14 @@ static PetscErrorCode PartitionGetRange(PetscInt M,PetscInt p,PetscInt t,PetscIn
   return 0;
 }
 
-PetscErrorCode GridCreate(MPI_Comm comm,const PetscInt M[3],const PetscInt p[3],PetscInt cmax,Grid *grid)
+PetscErrorCode GridCreate(MPI_Comm comm,const PetscInt M[3],const PetscInt p[3],PetscInt cmax,PetscInt nsrb,PetscInt sridx,Grid *grid)
 {
   PetscErrorCode ierr;
   Grid g;
   PetscMPIInt size,rank;
   PetscInt CM[3],Cp[3],j;
   zcode z;
+  PetscInt sr_A,sr_B,sr_nb0,sr_n;
 
   PetscFunctionBegin;
   ierr = PetscMalloc1(1,&g);CHKERRQ(ierr);
@@ -166,6 +169,17 @@ PetscErrorCode GridCreate(MPI_Comm comm,const PetscInt M[3],const PetscInt p[3],
   ierr = MPI_Comm_size(comm,&size);CHKERRQ(ierr);
   ierr = MPI_Comm_rank(comm,&rank);CHKERRQ(ierr);
   if (size != p[0]*p[1]*p[2]) SETERRQ4(comm,PETSC_ERR_ARG_INCOMP,"Communicator size %d incompatible with process grid %D,%D,%D",size,p[0],p[1],p[2]);
+
+  ierr = PetscOptionsBegin(comm,NULL,"SR Options",NULL);CHKERRQ(ierr);
+  sr_A = 2;
+  ierr = PetscOptionsInt("-sr-A","Number of SR buffer cells on finest grid (finite buffer schedual)","",sr_A,&sr_A,NULL);CHKERRQ(ierr);
+  sr_B = 2;
+  ierr = PetscOptionsInt("-sr-B","Increment to number of SR buffer cells on coarse grids (finite buffer schedual)","",sr_B,&sr_B,NULL);CHKERRQ(ierr);
+  sr_nb0 = 0;
+  ierr = PetscOptionsInt("-sr-nbzero","Number of SR buffer cells on transition level (infinite buffer schedual). =0 for finite buffer scheudal","",sr_nb0,&sr_nb0,NULL);CHKERRQ(ierr);
+  if (sr_nb0<0) SETERRQ1(comm,PETSC_ERR_ARG_INCOMP,"Negative SR buffer %D",sr_nb0);
+  ierr = PetscOptionsInt("-sr-n","Number of SR levels (<0 for maximum number of SR levels)","",sr_n,&sr_n,NULL);CHKERRQ(ierr);
+  ierr = PetscOptionsEnd();CHKERRQ(ierr);
 
   for (j=0; j<3; j++) {
     Cp[j] = CeilDiv(p[j],2); // Proposed coarse process set if we restrict communicator
@@ -193,15 +207,32 @@ PetscErrorCode GridCreate(MPI_Comm comm,const PetscInt M[3],const PetscInt p[3],
     zcode t;
     PetscInt cnt,coarsecnt,nneighbors,Cm[3],Cs[3],mask;
 
+    // SR: set nsrb & sridx
+    if (sridx==-3) sridx = -2; // last was transition, I am pure SR coarse grid
+    else if (sr_n && sridx >= -1) { // make SR/tran level
+      if (sridx == -1) { // finest grid
+	sridx = 0;
+	nsrb = sr_A; // not used with IBS
+      }
+      else {
+	sridx++;
+	nsrb = nsrb + sr_B; // not used with IBS
+      }
+      if (sr_n>0 && sridx>=sr_n) sridx = -3; // transition grid with SR grid limit so I am a transition grid
+      else if (sr_nb0>0) nsrb = 999; // just to say I am SR/tran for IB
+      else if (nsrb<=0 && sr_nb0==0) SETERRQ1(comm,PETSC_ERR_ARG_INCOMP,"SR A & B must be > 0: %D",sr_A);
+    }
+
     if (CeilDiv(CM[0],Cp[0]) * CeilDiv(CM[1],Cp[1]) * CeilDiv(CM[2],Cp[2]) > cmax || size == 1) {
       for (j=0; j<3; j++) Cp[j] = p[j]; // Coarsen on the same process set
-      ierr = GridCreate(comm,CM,Cp,cmax,&g->coarse);CHKERRQ(ierr);
+      ierr = GridCreate(comm,CM,Cp,cmax,nsrb,sridx,&g->coarse);CHKERRQ(ierr);
       mask = 00;
     } else { // z&07==0 will participate in coarse grid
       MPI_Comm ccomm;
       ierr = MPI_Comm_split(comm,z&07?MPI_UNDEFINED:0,0,&ccomm);CHKERRQ(ierr);
+      if (sridx!=-2) sridx = -3; // next grid is split so I am a transition grid
       if (ccomm != MPI_COMM_NULL) { // I continue to coarse grid
-        ierr = GridCreate(ccomm,CM,Cp,cmax,&g->coarse);CHKERRQ(ierr);
+        ierr = GridCreate(ccomm,CM,Cp,cmax,-999,-2,&g->coarse);CHKERRQ(ierr);
         ierr = MPI_Comm_free(&ccomm);CHKERRQ(ierr);
       } else g->coarse = NULL;
       mask = 07;
@@ -273,6 +304,26 @@ PetscErrorCode GridCreate(MPI_Comm comm,const PetscInt M[3],const PetscInt p[3],
   }
 
   if (g->m[0]*g->m[1]*g->m[2] <= 0) SETERRQ7(PETSC_COMM_SELF,PETSC_ERR_ARG_INCOMP,"Invalid grid L[%D,%D,%D] of G[%D,%D,%D] on level %D",g->m[0],g->m[1],g->m[2],g->M[0],g->M[1],g->M[2],g->level);
+
+  // set meta data
+  g->sridx = sridx;
+  if (sridx>=0) { // SR level
+    for (j=0; j<3; j++) {
+      if (g->s[j]%2) SETERRQ1(comm,PETSC_ERR_ARG_INCOMP,"SR start must be even: %D, for now",g->s[j]);
+      if (g->m[j]%2) SETERRQ1(comm,PETSC_ERR_ARG_INCOMP,"SR size must be even: %D, for now",g->m[j]);
+    }
+  }
+  if (sridx>=0) {
+    if (sr_nb0>0) { // infinite buffer schedual
+      if (g->coarse->sridx == -3) g->coarse->nsrb = sr_nb0;
+      g->nsrb = 2*g->coarse->nsrb;
+    }
+    else g->nsrb = nsrb; // finite buffer schedual set on way up
+    if (g->coarse->sridx == -3) {
+      PetscPrintf(PETSC_COMM_WORLD,"\t%d) SR: TRANSITION level meta data (nsrb=%D sridx=%D) m[%D,%D,%D] of s[%D,%D,%D]\n",g->coarse->level,g->coarse->nsrb,g->coarse->sridx,g->m[0],g->m[1],g->m[2],g->level,g->s[0],g->s[1],g->s[2],g->level);
+    }
+    PetscPrintf(PETSC_COMM_WORLD,"\t%d) SR level meta data (nsrb=%D sridx=%D) m[%D,%D,%D] of s[%D,%D,%D]\n",g->level,g->nsrb,sridx,g->m[0],g->m[1],g->m[2],g->level,g->s[0],g->s[1],g->s[2],g->level);
+  }
 
   g->refct = 1;
   *grid = g;

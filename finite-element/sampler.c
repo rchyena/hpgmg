@@ -153,7 +153,7 @@ static PetscErrorCode SampleOnGrid(MPI_Comm comm,Op op,const PetscInt M[3],const
   // large numbers of processes, the coarse grids should be square enough that 192 is a good threshold size.
   cmax = 192;
 
-  ierr = GridCreate(comm,M,pgrid,cmax,&grid);CHKERRQ(ierr);
+  ierr = GridCreate(comm,M,pgrid,cmax,-1,-1,&grid);CHKERRQ(ierr);
   ierr = GridGetNumLevels(grid,&nlevels);CHKERRQ(ierr);
 
   ierr = DMCreateFE(grid,fedegree,dof,&dm);CHKERRQ(ierr);
