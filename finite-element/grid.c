@@ -14,6 +14,7 @@ struct Grid_private {
   MPI_Comm comm;
   Grid coarse;
   PetscInt level;
+  PetscInt flevel;
   PetscInt M[3],p[3];
   PetscInt s[3],m[3];   // Owned cells of global grid
   struct {
@@ -138,6 +139,17 @@ PetscInt GridLevelFromM(const PetscInt M[3]) {
   return level;
 }
 
+static PetscInt fineM[3]={-1,-1,-1};
+PetscInt GridFLevelFromM(const PetscInt M[3]) {
+  PetscInt m[3] = {M[0],M[1],M[2]},level;
+  for (level=0; m[0]<fineM[0] && m[1]<fineM[1] && m[2]<fineM[2]; level++) {
+    m[0] *= 2;
+    m[1] *= 2;
+    m[2] *= 2;
+  }
+  return level;
+}
+
 // The range {0..M-1} is partitioned into p parts.  Find which part i falls in.
 static PetscInt PartitionFind(PetscInt M,PetscInt p,PetscInt i) {
   PetscInt t = i/(M/p);  // M/p is a lower bound for actual subdomain size, so t is an upper bound
@@ -167,6 +179,12 @@ PetscErrorCode GridCreate(MPI_Comm comm,const PetscInt M[3],const PetscInt p[3],
   ierr = MPI_Comm_rank(comm,&rank);CHKERRQ(ierr);
   if (size != p[0]*p[1]*p[2]) SETERRQ4(comm,PETSC_ERR_ARG_INCOMP,"Communicator size %d incompatible with process grid %D,%D,%D",size,p[0],p[1],p[2]);
 
+  if (fineM[0]<M[0] ||fineM[1]<M[1] || fineM[2]<M[2]) {
+    fineM[0] = M[0];
+    fineM[1] = M[1];
+    fineM[2] = M[2];
+  }
+
   for (j=0; j<3; j++) {
     Cp[j] = CeilDiv(p[j],2); // Proposed coarse process set if we restrict communicator
     CM[j] = M[j]/2;          // Coarse grid size (if there is a coarser grid)
@@ -174,7 +192,8 @@ PetscErrorCode GridCreate(MPI_Comm comm,const PetscInt M[3],const PetscInt p[3],
     g->p[j] = p[j];
   }
   g->level = GridLevelFromM(M);
-
+  g->flevel = GridFLevelFromM(M);
+PetscPrintf(PETSC_COMM_WORLD,"GridCreate: g->flevel=%d\n",g->flevel);
   // Find ownership
   z = ZCodeFromRank(rank,p);
 
