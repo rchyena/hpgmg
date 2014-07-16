@@ -179,7 +179,9 @@ PetscErrorCode GridCreate(MPI_Comm comm,const PetscInt M[3],const PetscInt p[3],
   ierr = MPI_Comm_rank(comm,&rank);CHKERRQ(ierr);
   if (size != p[0]*p[1]*p[2]) SETERRQ4(comm,PETSC_ERR_ARG_INCOMP,"Communicator size %d incompatible with process grid %D,%D,%D",size,p[0],p[1],p[2]);
 
+  // set global fine M here -- kind of fragile
   if (fineM[0]<M[0] ||fineM[1]<M[1] || fineM[2]<M[2]) {
+    //if (fineM[0]!=-1) SETERRQ2(comm,PETSC_ERR_ARG_INCOMP,"Increasing fineM %d --> %D",fineM[0],M[0]);
     fineM[0] = M[0];
     fineM[1] = M[1];
     fineM[2] = M[2];
@@ -193,7 +195,7 @@ PetscErrorCode GridCreate(MPI_Comm comm,const PetscInt M[3],const PetscInt p[3],
   }
   g->level = GridLevelFromM(M);
   g->flevel = GridFLevelFromM(M);
-PetscPrintf(PETSC_COMM_WORLD,"GridCreate: g->flevel=%d\n",g->flevel);
+
   // Find ownership
   z = ZCodeFromRank(rank,p);
 
@@ -1048,8 +1050,11 @@ PetscErrorCode DMCreateFE(Grid grid,PetscInt fedegree,PetscInt dof,DM *dmfe)
   PetscSFNode *iremote;
   FE     fe;
   DM          dm;
+  PetscInt sr_A,sr_B,sr_nb0,sr_n,nsrb,nsr;
+  PetscMPIInt wsize;
 
   PetscFunctionBegin;
+  ierr = MPI_Comm_size(PETSC_COMM_WORLD,&wsize);CHKERRQ(ierr);
   ierr = PetscNew(&fe);CHKERRQ(ierr);
   grid->refct++;
   fe->grid = grid;
@@ -1073,6 +1078,44 @@ PetscErrorCode DMCreateFE(Grid grid,PetscInt fedegree,PetscInt dof,DM *dmfe)
       PetscInt ri = PartitionFind(grid->M[i],grid->p[i],grid->s[i]+grid->m[i]),s,m;
       ierr = PartitionGetRange(grid->M[i],grid->p[i],ri,&s,&m);CHKERRQ(ierr);
       rneighbor_om[i] = m*fedegree + (s+m == grid->M[i]);
+    }
+  }
+  //PetscPrintf(PETSC_COMM_WORLD,"%d) DMCreateFE: g.s[%D,%D,%D] fe.om[%D,%D,%D] fe.lm[%D,%D,%D] fe.lM[%D,%D,%D]\n",grid->flevel,grid->s[0],grid->s[1],grid->s[2],fe->om[0],fe->om[1],fe->om[2],fe->lm[0],fe->lm[1],fe->lm[2],fe->lM[0],fe->lM[1],fe->lM[2]);
+  // create SR meta data
+  ierr = PetscOptionsBegin(grid->comm,NULL,"SR Options",NULL);CHKERRQ(ierr);
+  sr_A = 2;
+  ierr = PetscOptionsInt("-sr-A","Number of SR buffer cells on finest grid (finite buffer schedual)","",sr_A,&sr_A,NULL);CHKERRQ(ierr);
+  sr_B = 2;
+  ierr = PetscOptionsInt("-sr-B","Increment to number of SR buffer cells on coarse grids (finite buffer schedual)","",sr_B,&sr_B,NULL);CHKERRQ(ierr);
+  sr_nb0 = 0;
+  ierr = PetscOptionsInt("-sr-nbzero","Number of SR buffer cells on transition level (infinite buffer schedual). =0 for finite buffer scheudal","",sr_nb0,&sr_nb0,NULL);CHKERRQ(ierr);
+  if (sr_nb0<0) SETERRQ1(grid->comm,PETSC_ERR_ARG_INCOMP,"Negative SR buffer %D",sr_nb0);
+  ierr = PetscOptionsInt("-sr-n","Number of SR levels (<0 for maximum number of SR levels)","",sr_n,&sr_n,NULL);CHKERRQ(ierr);
+  ierr = PetscOptionsEnd();CHKERRQ(ierr);
+  if (sr_n) {
+    Grid g; // figure out max number of SR levels
+    for (nsr=grid->flevel-1, g=grid; g && wsize==g->p[0]*g->p[1]*grid->p[2]; g=g->coarse) nsr++;
+    if (sr_n<0) sr_n = nsr;
+    else if  (sr_n>nsr) sr_n = nsr;
+    if ((grid->flevel<sr_n || sr_n<0) && grid->coarse && wsize==grid->coarse->p[0]*grid->coarse->p[1]*grid->coarse->p[2]) { // we are sr
+      //PetscPrintf(PETSC_COMM_WORLD,"%d) DMCreateFE: sr_A=%D, sr_B=%D, sr_nb0=%D, sr_n=%D\n",grid->flevel,sr_A,sr_B,sr_nb0,sr_n);
+      nsrb = (sr_nb0==0) ? sr_A + grid->flevel*sr_B: sr_nb0*PetscPowInt(2, sr_n-grid->flevel);
+      if (nsrb%2) SETERRQ1(grid->comm,PETSC_ERR_ARG_INCOMP,"SR coarsest level buffer schedual must be even for now: %D",nsrb);
+
+      PetscPrintf(PETSC_COMM_WORLD,"\t\t%d) DMCreateFE:            SR grid nsrb=%D\n",grid->flevel,nsrb);
+    }
+    else if ((grid->flevel==sr_n || sr_n<0) && wsize==grid->p[0]*grid->p[1]*grid->p[2]) { // we are trans
+      if (grid->flevel) { // can not have only the transition level
+	if (sr_nb0==0) {
+	  nsrb = sr_A + (grid->flevel-1)*sr_B;
+	  if (nsrb%2) SETERRQ1(grid->comm,PETSC_ERR_ARG_INCOMP,"SR coarsest level buffer schedual must be even for now: %D",nsrb);
+	  nsrb = nsrb/2;
+	}
+	else nsrb = sr_nb0;
+
+	PetscPrintf(PETSC_COMM_WORLD,"\t\t%d) DMCreateFE: SR TRANSITION grid nsrb=%D\n",grid->flevel,nsrb);
+      }
+      //else PetscPrintf(PETSC_COMM_WORLD,"\t\t\t%d) DMCreateFE: skip SR TRANSITION -- no SR\n",grid->flevel);
     }
   }
 
