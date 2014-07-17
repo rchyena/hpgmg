@@ -51,6 +51,8 @@ struct FE_private {
   //                                                             lm=a+1-2=9
   PetscInt lM[3];       // Array dimensions of local vectors (includes enough fringe for interpolation)
   PetscInt ls[3],lm[3]; // Start and extent of active part of local vector
+  PetscInt csrfcs[3],csrfcm[3]; // Start and extent of cover of coarse grid
+  PetscInt srls[3],srlm[3];   // Start and extent of local SR vector with "BCs" on all sides
   PetscReal Luniform[3];
   PetscBool hascoordinates;
   MPI_Datatype unit;
@@ -1050,7 +1052,7 @@ PetscErrorCode DMCreateFE(Grid grid,PetscInt fedegree,PetscInt dof,DM *dmfe)
   PetscSFNode *iremote;
   FE     fe;
   DM          dm;
-  PetscInt sr_A,sr_B,sr_nb0,sr_n,nsrb,nsr;
+  PetscInt sr_A,sr_B,sr_nb0,sr_n,nsrb,cnsrb,nsr;
   PetscMPIInt wsize;
 
   PetscFunctionBegin;
@@ -1080,7 +1082,7 @@ PetscErrorCode DMCreateFE(Grid grid,PetscInt fedegree,PetscInt dof,DM *dmfe)
       rneighbor_om[i] = m*fedegree + (s+m == grid->M[i]);
     }
   }
-  //PetscPrintf(PETSC_COMM_WORLD,"%d) DMCreateFE: g.s[%D,%D,%D] fe.om[%D,%D,%D] fe.lm[%D,%D,%D] fe.lM[%D,%D,%D]\n",grid->flevel,grid->s[0],grid->s[1],grid->s[2],fe->om[0],fe->om[1],fe->om[2],fe->lm[0],fe->lm[1],fe->lm[2],fe->lM[0],fe->lM[1],fe->lM[2]);
+  //PetscPrintf(PETSC_COMM_SELF,"%d) DMCreateFE: g.s[%D,%D,%D] fe.om[%D,%D,%D] fe.ls[%D,%D,%D] fe.lm[%D,%D,%D] fe.lM[%D,%D,%D]\n",grid->flevel,grid->s[0],grid->s[1],grid->s[2],fe->om[0],fe->om[1],fe->om[2],fe->ls[0],fe->ls[1],fe->ls[2],fe->lm[0],fe->lm[1],fe->lm[2],fe->lM[0],fe->lM[1],fe->lM[2]);
   // create SR meta data
   ierr = PetscOptionsBegin(grid->comm,NULL,"SR Options",NULL);CHKERRQ(ierr);
   sr_A = 2;
@@ -1092,19 +1094,39 @@ PetscErrorCode DMCreateFE(Grid grid,PetscInt fedegree,PetscInt dof,DM *dmfe)
   if (sr_nb0<0) SETERRQ1(grid->comm,PETSC_ERR_ARG_INCOMP,"Negative SR buffer %D",sr_nb0);
   ierr = PetscOptionsInt("-sr-n","Number of SR levels (<0 for maximum number of SR levels)","",sr_n,&sr_n,NULL);CHKERRQ(ierr);
   ierr = PetscOptionsEnd();CHKERRQ(ierr);
-  if (sr_n) {
+  if (sr_n && wsize==grid->p[0]*grid->p[1]*grid->p[2]) {
     Grid g; // figure out max number of SR levels
     for (nsr=grid->flevel-1, g=grid; g && wsize==g->p[0]*g->p[1]*grid->p[2]; g=g->coarse) nsr++;
-    if (sr_n<0) sr_n = nsr;
-    else if  (sr_n>nsr) sr_n = nsr;
-    if ((grid->flevel<sr_n || sr_n<0) && grid->coarse && wsize==grid->coarse->p[0]*grid->coarse->p[1]*grid->coarse->p[2]) { // we are sr
-      //PetscPrintf(PETSC_COMM_WORLD,"%d) DMCreateFE: sr_A=%D, sr_B=%D, sr_nb0=%D, sr_n=%D\n",grid->flevel,sr_A,sr_B,sr_nb0,sr_n);
-      nsrb = (sr_nb0==0) ? sr_A + grid->flevel*sr_B: sr_nb0*PetscPowInt(2, sr_n-grid->flevel);
-      if (nsrb%2) SETERRQ1(grid->comm,PETSC_ERR_ARG_INCOMP,"SR coarsest level buffer schedual must be even for now: %D",nsrb);
+    if (sr_n<0) sr_n = nsr;          // negative num sr levels, max number of levels
+    else if  (sr_n>nsr) sr_n = nsr;  // clip desired num SR levels by max
+    if ((grid->flevel<sr_n || sr_n<0) && grid->coarse && wsize==grid->coarse->p[0]*grid->coarse->p[1]*grid->coarse->p[2]) { // coarse is full so we are sr
+      nsrb = (sr_nb0==0) ? sr_A + grid->flevel*sr_B: sr_nb0*PetscPowInt(2, sr_n - grid->flevel);
+      if (nsrb%2) SETERRQ1(grid->comm,PETSC_ERR_ARG_INCOMP,"SR level buffer schedual must be even for now: %D",nsrb);
+      if (nsrb>fe->lm[0] || nsrb>fe->lm[1] || nsrb>fe->lm[2]) SETERRQ1(grid->comm,PETSC_ERR_ARG_INCOMP,"SR buffer too large (>lm): %D",nsrb);
 
-      PetscPrintf(PETSC_COMM_WORLD,"\t\t%d) DMCreateFE:            SR grid nsrb=%D\n",grid->flevel,nsrb);
+      if ((grid->coarse->flevel<sr_n || sr_n<0) && grid->coarse->coarse && wsize==grid->coarse->coarse->p[0]*grid->coarse->coarse->p[1]*grid->coarse->coarse->p[2]) { // coarse is sr
+	cnsrb = (sr_nb0==0) ? sr_A + (grid->flevel+1)*sr_B: sr_nb0*PetscPowInt(2, sr_n - (grid->flevel+1));
+      }
+      else {
+	cnsrb = nsrb/2; // transition level just needs to cover fine for prolongation - simple for Q1
+      }
+
+      for (i=0; i<3; i++) {
+	// set size of compute region: sr buffer | lm | sr buffer
+	fe->srlm[i] = fe->lm[i];
+	fe->srls[i] = nsrb;  // offset into genuine 'lm'
+	if (grid->neighborranks[1+(i==0)][1+(i==1)][1+(i==2)] >= 0) fe->srlm[i] += nsrb;  // have a high neighbor (not a BC)
+	if (grid->neighborranks[1-(i==0)][1-(i==1)][1-(i==2)] >= 0) fe->srlm[i] += nsrb;  // have a low neighbor (not a BC)
+	else fe->srls[i] = 0; // low BC, no SR buffer
+	// set next fine grid cover: coarse nsrb - fine nsrb/2
+	if (!fe->srlm[i]%2) SETERRQ1(grid->comm,PETSC_ERR_ARG_INCOMP,"SR lm must be odd for now: %D",fe->srlm[i]);
+	fe->csrfcm[i] = fe->srlm[i]/2 + 1; // extent of cover simply coarsening of domain
+	if (grid->neighborranks[1-(i==0)][1-(i==1)][1-(i==2)] >= 0) fe->csrfcs[i] = cnsrb - nsrb/2; // have a low neighbor (not a BC)
+	else fe->csrfcs[i] = 0; // low BC, no SR buffer
+      }
+      PetscPrintf(PETSC_COMM_WORLD,"\t\t%d) DMCreateFE:            SR grid nsrb=%D cnsrb=%D\n",grid->flevel,nsrb,cnsrb);
     }
-    else if ((grid->flevel==sr_n || sr_n<0) && wsize==grid->p[0]*grid->p[1]*grid->p[2]) { // we are trans
+    else if (grid->flevel==sr_n || sr_n<0) { // we are trans
       if (grid->flevel) { // can not have only the transition level
 	if (sr_nb0==0) {
 	  nsrb = sr_A + (grid->flevel-1)*sr_B;
@@ -1113,10 +1135,20 @@ PetscErrorCode DMCreateFE(Grid grid,PetscInt fedegree,PetscInt dof,DM *dmfe)
 	}
 	else nsrb = sr_nb0;
 
+	for (i=0; i<3; i++) {
+	  fe->csrfcs[i] = fe->csrfcm[i] = -1;
+	  fe->srlm[i] = fe->lm[i];
+	  fe->srls[i] = nsrb;  // offset into genuine 'lm'
+	  if (grid->neighborranks[1+(i==0)][1+(i==1)][1+(i==2)] >= 0) fe->srlm[i] += nsrb;  // have a high neighbor (not a BC)
+	  if (grid->neighborranks[1-(i==0)][1-(i==1)][1-(i==2)] >= 0) fe->srlm[i] += nsrb;  // have a low neighbor (not a BC)
+	  else fe->srls[i] = 0; // low BC, no SR buffer
+	}
 	PetscPrintf(PETSC_COMM_WORLD,"\t\t%d) DMCreateFE: SR TRANSITION grid nsrb=%D\n",grid->flevel,nsrb);
       }
-      //else PetscPrintf(PETSC_COMM_WORLD,"\t\t\t%d) DMCreateFE: skip SR TRANSITION -- no SR\n",grid->flevel);
     }
+  }
+  else {
+    for (i=0; i<3; i++) fe->csrfcs[i] = fe->csrfcm[i] = fe->srls[i] = fe->srlm[i] = -2;
   }
 
   // Create neighbor scatter (roots=global, leaves=local)
