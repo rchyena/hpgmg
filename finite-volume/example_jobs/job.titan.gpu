@@ -1,0 +1,46 @@
+#!/bin/sh
+#PBS -A CSC103
+#PBS -N HPGMG
+#PBS -o results.titan.gpu
+#PBS -j oe
+#PBS -l walltime=0:15:00
+#PBS -l nodes=64
+#PBS -q debug
+
+source $MODULESHOME/init/bash
+module load cudatoolkit
+export MPICH_RDMA_ENABLED_CUDA=1
+#export LD_LIBRARY_PATH=$CRAY_LD_LIBRARY_PATH:$LD_LIBRARY_PATH
+#export MPICH_G2G_PIPELINE=32
+#export PMI_NO_FORK=1
+#export CUDA_MANAGED_FORCE_DEVICE_ALLOC=1
+
+set -x
+cd $PBS_O_WORKDIR
+export OMP_NUM_THREADS=4
+
+# normal run
+#aprun -n  1 -N 1 -d 4 ./run.titan.gpu 6 64
+#aprun -n  8 -N 1 -d 4 ./run.titan.gpu 6 64
+#aprun -n 27 -N 1 -d 4 ./run.titan.gpu 6 64
+#aprun -n 64 -N 1 -d 4 ./run.titan.gpu 6 64
+
+aprun -n  1 -N 1 -d 4 ./run.titan.gpu 7 8
+aprun -n  8 -N 1 -d 4 ./run.titan.gpu 7 8
+aprun -n 27 -N 1 -d 4 ./run.titan.gpu 7 8
+aprun -n 64 -N 1 -d 4 ./run.titan.gpu 7 8
+
+aprun -n  1 -N 1 -d 4 ./run.titan.gpu 8 1
+aprun -n  8 -N 1 -d 4 ./run.titan.gpu 8 1
+aprun -n 27 -N 1 -d 4 ./run.titan.gpu 8 1
+aprun -n 64 -N 1 -d 4 ./run.titan.gpu 8 1
+
+#=== force cudaDeviceSync after each kernel ===
+export CUDA_LAUNCH_BLOCKING=1
+aprun -n 64 -N 1 -d 4 ./run.titan.gpu 8 1
+
+
+
+
+# generate nvprof timeline
+#aprun -b -n 1 -N 1 -d 4 nvprof --unified-memory-profiling per-process-device -o timeline.%p.nvp ./run.titan.gpu 7 8
